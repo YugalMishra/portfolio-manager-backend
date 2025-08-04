@@ -171,22 +171,35 @@ exports.getPortfolio = async (req, res) => {
     }
 
     const tickers = rows.map(row => row.ticker.toUpperCase());
+    const priceMap = {};
     const now = new Date();
 
-    const priceMap = {};
-
     for (let ticker of tickers) {
-        const [cache] = await db.execute('SELECT price, last_updated FROM price_cache WHERE ticker = ?', [ticker]);
+      const [cache] = await db.execute('SELECT price, last_updated FROM price_cache WHERE ticker = ?', [ticker]);
 
-        if (
-            cache.length > 0 &&
-            new Date() - new Date(cache[0].last_updated) < 24 * 60 * 60 * 1000
-        ) {
-    
+      const lastUpdated = cache.length > 0 ? new Date(cache[0].last_updated) : null;
+      const isFresh = lastUpdated && (now - lastUpdated < 24 * 60 * 60 * 1000);
+
+      if (isFresh) {
         priceMap[ticker] = parseFloat(cache[0].price);
-        } else {
-            console.warn(`No recent price for ${ticker}, skipping`);
+      } else {
+        try {
+          const response = await axios.get(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FINNHUB_API_KEY}`);
+          const closePrice = parseFloat(response.data.c);
+
+          if (closePrice) {
+            priceMap[ticker] = closePrice;
+            await db.execute(
+              `REPLACE INTO price_cache (ticker, price, last_updated) VALUES (?, ?, NOW())`,
+              [ticker, closePrice]
+            );
+          } else {
+            console.warn(`No close price for ${ticker}`);
+          }
+        } catch (err) {
+          console.warn(`Failed to fetch Finnhub price for ${ticker}:`, err.message);
         }
+      }
     }
 
     const portfolio = [];
@@ -239,31 +252,47 @@ exports.getPerformance = async (req, res) => {
 
     let currentValue = 0;
     let investedAmount = 0;
+    const now = new Date();
 
     for (let asset of holdings) {
       const { ticker, quantity, avg_buy_price } = asset;
 
-    const [priceRow] = await db.execute(
+      const [priceRow] = await db.execute(
         'SELECT price, last_updated FROM price_cache WHERE ticker = ?',
         [ticker]
-    );
+      );
 
-    let marketPrice;
-    if (
-        priceRow.length > 0 &&
-        new Date() - new Date(priceRow[0].last_updated) < 24 * 60 * 60 * 1000
-    ) {
-    marketPrice = parseFloat(priceRow[0].price);
-    } else {
-        console.warn(`Price for ${ticker} is outdated or missing`);
-        continue;
-    }
+      let marketPrice;
+      const lastUpdated = priceRow.length > 0 ? new Date(priceRow[0].last_updated) : null;
+      const isFresh = lastUpdated && (now - lastUpdated < 24 * 60 * 60 * 1000);
 
-    const qty = parseFloat(quantity);
-    const avgPrice = parseFloat(avg_buy_price);
+      if (isFresh) {
+        marketPrice = parseFloat(priceRow[0].price);
+      } else {
+        try {
+          const response = await axios.get(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FINNHUB_API_KEY}`);
+          marketPrice = parseFloat(response.data.c);
 
-    currentValue += qty * marketPrice;
-    investedAmount += qty * avgPrice;
+          if (marketPrice) {
+            await db.execute(
+              `REPLACE INTO price_cache (ticker, price, last_updated) VALUES (?, ?, NOW())`,
+              [ticker, marketPrice]
+            );
+          } else {
+            console.warn(`No market price for ${ticker}`);
+            continue;
+          }
+        } catch (err) {
+          console.warn(`Error fetching price for ${ticker}:`, err.message);
+          continue;
+        }
+      }
+
+      const qty = parseFloat(quantity);
+      const avgPrice = parseFloat(avg_buy_price);
+
+      currentValue += qty * marketPrice;
+      investedAmount += qty * avgPrice;
     }
 
     const [realizedRow] = await db.execute(`
