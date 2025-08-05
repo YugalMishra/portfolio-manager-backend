@@ -2,84 +2,70 @@ require('dotenv').config();
 const db = require('../config/db');
 const axios = require('axios');
 
-exports.buyStock = async (req, res) => {
-    const { ticker, quantity } = req.body;
+exports.addAssetManually = async (req, res) => {
+  const { ticker, quantity, date } = req.body;
 
-    if(!ticker || !quantity || quantity <= 0) {
-        return res.status(400).json({ error: 'Ticker and quantity are required and must be valid'});
+  if (!ticker || !quantity || !date) {
+    return res.status(400).json({ error: "Ticker, quantity, and date are required" });
+  }
+
+  try {
+    const parsedDate = new Date(date);
+    const from = Math.floor(parsedDate.getTime() / 1000);
+    const to = from + 86400;
+    const finnhubKey = process.env.FINNHUB_API_KEY;
+
+    const response = await axios.get(`https://finnhub.io/api/v1/stock/candle`, {
+      params: {
+        symbol: ticker.toUpperCase(),
+        resolution: 'D',
+        from,
+        to,
+        token: finnhubKey
+      }
+    });
+
+    if (response.data.s !== 'ok' || !response.data.c || !response.data.c[0]) {
+      return res.status(400).json({ error: "Could not fetch historical price" });
     }
 
-    try {
-        const [cacheRows] = await db.execute('SELECT price, last_updated FROM price_cache WHERE ticker =?', [ticker.toUpperCase()]);
-        let price;
+    const price = parseFloat(response.data.c[0].toFixed(2));
+    const totalCost = quantity * price;
 
-        if(cacheRows.length > 0 && new Date() - new Date(cacheRows[0].last_updated) < 5*60*1000) {
-            price = cacheRows[0].price;
-        } else {
-            const finnhubKey = process.env.FINNHUB_API_KEY;
-            const response = await axios.get(`https://finnhub.io/api/v1/quote`, {
-                params: {
-                    symbol: `${ticker.toUpperCase()}`,
-                    token: finnhubKey
-                }
-            });
+    // 💸 Deduct from account
+    const [balanceRows] = await db.query(`
+      SELECT SUM(CASE 
+        WHEN action = 'DEPOSIT' THEN amount
+        WHEN action = 'SALE_PROCEEDS' THEN amount
+        ELSE -amount END) AS balance
+      FROM account_transactions
+    `);
 
-            const currentPrice = response.data.c;
-            if (!currentPrice) {
-                return res.status(400).json({ error: "Could not retrieve live price for ticker" });
-            }
-
-            price = parseFloat(currentPrice.toFixed(2));
-
-            if (!price) return res.status(400).json({ error: "Could not retrieve price for ticker"});
-
-            await db.execute(
-                'REPLACE INTO price_cache (ticker, price, last_updated) VALUES (?, ?, NOW())',
-                [ticker.toUpperCase(), price]
-            );
-        }
-
-        const priceNum = parseFloat(price);
-        const quantityNum = parseFloat(quantity);
-        const totalCost = priceNum * quantityNum;
-
-        const [balanceRows] = await db.query(`SELECT SUM(CASE 
-            WHEN action = 'DEPOSIT' THEN amount
-            WHEN action = 'SALE_PROCEEDS' THEN amount
-            else -amount END) AS balance
-        FROM account_transactions`);
-
-        const balance = balanceRows[0].balance || 0;
-
-        if(balance < totalCost) {
-            return res.status(400).json({error: 'Insufficient funds to buy stock'});
-        }
-
-        await db.execute(
-      `INSERT INTO account_transactions (action, amount, description) VALUES (?, ?, ?)`,
-      ['WITHDRAW', totalCost, `Bought ${quantity} of ${ticker.toUpperCase()} at ${price}`]
-    );
+    const balance = balanceRows[0].balance || 0;
+    if (balance < totalCost) {
+      return res.status(400).json({ error: "Insufficient funds to add asset" });
+    }
 
     await db.execute(
-      `INSERT INTO transactions (action, asset_type, ticker, quantity, price_per_unit, total_value) VALUES (?, ?, ?, ?, ?, ?)`,
-      ['BUY', 'stock', ticker.toUpperCase(), quantity, price, totalCost]
+      `INSERT INTO account_transactions (action, amount, description) VALUES (?, ?, ?)`,
+      ['WITHDRAW', totalCost, `Manually added ${quantity} of ${ticker.toUpperCase()} at ₹${price} on ${date}`]
     );
 
-
-    const [holdingRows] = await db.execute(
-      'SELECT quantity, avg_buy_price FROM portfolio_items WHERE ticker = ? AND asset_type = "stock"',
+    // 🗃 Update portfolio
+    const [existing] = await db.execute(
+      `SELECT quantity, avg_buy_price FROM portfolio_items WHERE ticker = ? AND asset_type = 'stock'`,
       [ticker.toUpperCase()]
     );
 
-    if (holdingRows.length > 0) {
-      const oldQty = holdingRows[0].quantity;
-      const oldAvg = holdingRows[0].avg_buy_price;
+    if (existing.length > 0) {
+      const oldQty = existing[0].quantity;
+      const oldAvg = existing[0].avg_buy_price;
 
       const newQty = parseFloat(oldQty) + parseFloat(quantity);
       const newAvg = ((oldQty * oldAvg) + (quantity * price)) / newQty;
 
       await db.execute(
-        `UPDATE portfolio_items SET quantity = ?, avg_buy_price = ? WHERE ticker = ? AND asset_type = "stock"`,
+        `UPDATE portfolio_items SET quantity = ?, avg_buy_price = ? WHERE ticker = ? AND asset_type = 'stock'`,
         [newQty, newAvg, ticker.toUpperCase()]
       );
     } else {
@@ -89,18 +75,18 @@ exports.buyStock = async (req, res) => {
       );
     }
 
-    res.status(201).json({ message: `Successfully bought ${quantity} of ${ticker} at ₹${price}` });
+    res.status(201).json({ message: `Added ${quantity} of ${ticker} at ₹${price} (on ${date})` });
   } catch (err) {
-    console.error('Buy stock error:', err.message || err);
+    console.error('Add asset error:', err.response?.status, err.response?.data || err.message);
     res.status(500).json({ error: 'Server error' });
   }
 };
 
-exports.sellStock = async (req, res) => {
-  const { ticker, quantity } = req.body;
+exports.removeAssetManually = async (req, res) => {
+  const { ticker, quantity, date } = req.body;
 
-  if (!ticker || !quantity || quantity <= 0) {
-    return res.status(400).json({ error: "Ticker and quantity are required and must be valid" });
+  if (!ticker || !quantity || !date) {
+    return res.status(400).json({ error: "Ticker, quantity, and date are required" });
   }
 
   try {
@@ -108,24 +94,34 @@ exports.sellStock = async (req, res) => {
     const quantityNum = parseFloat(quantity);
 
     const [holdingRows] = await db.execute(
-      `SELECT quantity, avg_buy_price FROM portfolio_items WHERE ticker = ? AND asset_type = 'stock'`,
+      `SELECT quantity FROM portfolio_items WHERE ticker = ? AND asset_type = 'stock'`,
       [upperTicker]
     );
 
     if (holdingRows.length === 0 || holdingRows[0].quantity < quantityNum) {
-      return res.status(400).json({ error: "Insufficient holdings to sell" });
+      return res.status(400).json({ error: "Insufficient holdings to remove" });
     }
 
-    const apiKey = process.env.FINNHUB_API_KEY;
-    const finnhubRes = await axios.get(`https://finnhub.io/api/v1/quote?symbol=${upperTicker}&token=${apiKey}`);
-    const livePrice = finnhubRes.data.c;
+    const parsedDate = new Date(date);
+    const from = Math.floor(parsedDate.getTime() / 1000);
+    const to = from + 86400;
+    const finnhubKey = process.env.FINNHUB_API_KEY;
 
-    if (!livePrice || livePrice <= 0) {
-        return res.status(400).json({ error: 'Could not fetch live price for this ticker' });
+    const response = await axios.get(`https://finnhub.io/api/v1/stock/candle`, {
+      params: {
+        symbol: upperTicker,
+        resolution: 'D',
+        from,
+        to,
+        token: finnhubKey
+      }
+    });
+
+    if (response.data.s !== 'ok' || !response.data.c || !response.data.c[0]) {
+      return res.status(400).json({ error: "Could not fetch historical price" });
     }
 
-    const price = parseFloat(livePrice.toFixed(2));
-
+    const price = parseFloat(response.data.c[0].toFixed(2));
     const totalValue = price * quantityNum;
 
     const newQty = holdingRows[0].quantity - quantityNum;
@@ -142,20 +138,15 @@ exports.sellStock = async (req, res) => {
       );
     }
 
-    await db.execute(
-      `INSERT INTO transactions (action, asset_type, ticker, quantity, price_per_unit, total_value) VALUES (?, ?, ?, ?, ?, ?)`,
-      ['SELL', 'stock', upperTicker, quantityNum, price, totalValue]
-    );
-
+    // 💰 Add to account
     await db.execute(
       `INSERT INTO account_transactions (action, amount, description) VALUES (?, ?, ?)`,
-      ['SALE_PROCEEDS', totalValue, `Sold ${quantityNum} of ${upperTicker} at ₹${price}`]
+      ['SALE_PROCEEDS', totalValue, `Manually removed ${quantity} of ${upperTicker} at ₹${price} on ${date}`]
     );
 
-    res.status(201).json({ message: `Successfully sold ${quantity} of ${upperTicker} at ₹${price}` });
-
+    res.status(200).json({ message: `Removed ${quantity} of ${upperTicker} at ₹${price} (on ${date})` });
   } catch (err) {
-    console.error("Sell stock error:", err.message || err);
+    console.error("Remove asset error:", err.message);
     res.status(500).json({ error: "Server error" });
   }
 };
