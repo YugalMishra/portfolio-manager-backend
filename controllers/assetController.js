@@ -121,19 +121,19 @@ const getPortfolioController = async (req, res) => {
 
       const current_price = quote.c;
       const current_value = current_price * asset.quantity;
-      const percent_change = ((current_price - asset.price) / asset.price) * 100;
-      const unrealized_profit = current_value - asset.quantity * asset.price;
+      const unrealized_profit = current_value - (asset.quantity * asset.purchase_price);
+      const percent_change = ((current_price - asset.purchase_price) / asset.purchase_price) * 100;
 
       portfolio.push({
         ...asset,
         current_price,
         current_value,
-        percent_change: percent_change.toFixed(2),
-        unrealized_profit: unrealized_profit.toFixed(2)
+        unrealized_profit: unrealized_profit.toFixed(2),
+        percent_change: percent_change.toFixed(2)
       });
     }
 
-    res.status(200).json({ portfolio });
+    res.status(200).json({ portfolio }); // ✅ Return wrapped in { portfolio }
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal Server Error' });

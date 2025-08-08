@@ -15,16 +15,19 @@ const addAsset = async ({ symbol, type, quantity, price }) => {
 const getAllAssets = async () => {
   const [rows] = await db.execute(`
     SELECT 
-      symbol,
-      type,
-      SUM(quantity) AS quantity,
-      SUM(quantity * price) / SUM(quantity) AS price
-    FROM asset_transactions
-    WHERE action = 'buy'
-    GROUP BY symbol, type
+  symbol,
+  type,
+  SUM(CASE WHEN action = 'buy' THEN quantity ELSE -quantity END) AS quantity,
+  SUM(CASE WHEN action = 'buy' THEN quantity * price ELSE 0 END) / 
+    NULLIF(SUM(CASE WHEN action = 'buy' THEN quantity ELSE 0 END), 0) AS purchase_price
+FROM asset_transactions
+GROUP BY symbol, type
+HAVING quantity > 0
+
   `);
   return rows;
 };
+
 
 const getAssetBySymbol = async (symbol) => {
   const [rows] = await db.execute(
